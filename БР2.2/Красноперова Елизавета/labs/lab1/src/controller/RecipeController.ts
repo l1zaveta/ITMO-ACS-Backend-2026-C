@@ -64,9 +64,7 @@ export class RecipeController {
             if (sort_by === "likes_count") {
                 dataQb.orderBy("likes_count", "DESC");
             } else if (sort_by === "cooking_time_min") {
-                dataQb.orderBy("r.cooking_time_min", "ASC");
-            } else if (sort_by === "difficulty") {
-                dataQb.orderBy("r.difficulty", "ASC");
+                 dataQb.orderBy("r.cooking_time_min", "ASC");
             } else {
                 dataQb.orderBy("r.published_at", "DESC");
             }
@@ -178,17 +176,47 @@ export class RecipeController {
 
     
     static update = async (req: AuthRequest, res: Response) => {
-        try {
-            const recipe = await recipeRepository().findOne({ where: { recipe_id: +req.params.recipe_id } });
-            if (!recipe) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Рецепт не найден" } });
-            if (recipe.author_id !== req.userId) return res.status(403).json({ error: { code: "FORBIDDEN", message: "Чужой рецепт" } });
+    try {
+        const recipe = await recipeRepository().findOne({
+            where: { recipe_id: +req.params.recipe_id }
+        });
 
-            await recipeRepository().update(+req.params.recipe_id, req.body);
-            return res.json({ message: "Рецепт обновлён" });
-        } catch (error) {
-            return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Ошибка обновления" } });
+        if (!recipe) {
+            return res.status(404).json({
+                error: {
+                    code: "NOT_FOUND",
+                    message: "Рецепт не найден"
+                }
+            });
         }
-    };
+
+        if (recipe.author_id !== req.userId) {
+            return res.status(403).json({
+                error: {
+                    code: "FORBIDDEN",
+                    message: "Чужой рецепт"
+                }
+            });
+        }
+
+        const { title, description, difficulty } = req.body;
+
+        await recipeRepository().update(+req.params.recipe_id, {
+            title,
+            description,
+            difficulty
+        });
+
+        return res.json({ message: "Рецепт обновлён" });
+    } catch (error) {
+        return res.status(400).json({
+            error: {
+                code: "VALIDATION_ERROR",
+                message: "Ошибка обновления"
+            }
+        });
+    }
+};
 
     
     static delete = async (req: AuthRequest, res: Response) => {

@@ -24,22 +24,38 @@ export class UserController {
     };
 
     static updateProfile = async (req: AuthRequest, res: Response) => {
-        try {
-            await userRepository().update(req.userId!, req.body);
-            const user = await userRepository().findOne({ where: { user_id: req.userId } });
-            return res.json({
-                user_id: user!.user_id,
-                username: user!.username,
-                email: user!.email,
-                avatar_url: user!.avatar_url,
-                bio: user!.bio,
-                created_at: user!.created_at,
-                role: user!.role
-            });
-        } catch (error) {
-            return res.status(409).json({ error: { code: "CONFLICT", message: "Email или username занят" } });
-        }
-    };
+    try {
+        const { username, email, bio, avatar_url } = req.body;
+
+        await userRepository().update(req.userId!, {
+            username,
+            email,
+            bio,
+            avatar_url
+        });
+
+        const user = await userRepository().findOne({
+            where: { user_id: req.userId }
+        });
+
+        return res.json({
+            user_id: user!.user_id,
+            username: user!.username,
+            email: user!.email,
+            avatar_url: user!.avatar_url,
+            bio: user!.bio,
+            created_at: user!.created_at,
+            role: user!.role
+        });
+    } catch (error) {
+        return res.status(409).json({
+            error: {
+                code: "CONFLICT",
+                message: "Email или username занят"
+            }
+        });
+    }
+};
 
     static myRecipes = async (req: AuthRequest, res: Response) => {
         const [items, total] = await recipeRepository().findAndCount({
