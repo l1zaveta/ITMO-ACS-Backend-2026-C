@@ -1,190 +1,159 @@
- import { Request, Response as ExpressResponse } from "express";
+import { Request, Response } from "express";
 import { AppDataSource } from "../index";
 import { Recipe } from "../entity/Recipe";
+import { Step } from "../entity/Step";
+import { RecipeIngredient } from "../entity/RecipeIngredient";
 import { AuthRequest } from "../middleware/auth";
 
-const recipes = () =>
-    AppDataSource.getRepository(Recipe);
-
-const token = () =>
-    process.env.SERVICE_TOKEN || "internal-service-token";
-
-const userUrl = () =>
-    process.env.USER_SERVICE_URL || "http://localhost:3001";
-
-async function call(
-    base: string,
-    path: string,
-    options: any = {}
-) {
-    const response = await fetch(base + path, {
-        ...options,
-        headers: {
-            ...(options.headers || {}),
-            "x-service-token": token(),
-            "content-type": "application/json"
-        }
-    });
-
-    if (!response.ok) {
-        let error: any = {};
-
-        try {
-            error = await response.json();
-        } catch {
-           
-        }
-
-        throw new DependencyError(
-            response.status,
-            error?.code || "DEPENDENCY_ERROR",
-            error?.message || "Ошибка зависимого сервиса"
-        );
-    }
-
-    return response.json();
-}
+const recipes = () => AppDataSource.getRepository(Recipe);
+const token = () => process.env.SERVICE_TOKEN || "internal-service-token";
+const userUrl = () => process.env.USER_SERVICE_URL || "http://localhost:3001";
+const socialUrl = () => process.env.SOCIAL_SERVICE_URL || "http://localhost:3003";
 
 class DependencyError extends Error {
-    status: number;
-    code: string;
-
-    constructor(
-        status: number,
-        code: string,
-        message: string
-    ) {
+    constructor(public status: number, public code: string, message: string) {
         super(message);
         this.name = "DependencyError";
-        this.status = status;
-        this.code = code;
+    }
+}
+
+async function callJson(base: string, path: string, options: RequestInit = {}) {
+    let response: globalThis.Response;
+    try {
+        response = await fetch(base + path, {
+            ...options,
+            headers: {
+                ...(options.headers || {}),
+                "x-service-token": token(),
+                "content-type": "application/json"
+            }
+        });
+    } catch {
+        throw new DependencyError(503, "SERVICE_UNAVAILABLE", "Зависимый сервис недоступен");
+    }
+
+    let data: any = null;
+    try { data = await response.json(); } catch { /* empty */ }
+
+    if (!response.ok) {
+        throw new DependencyError(
+            response.status,
+            data?.error?.code || data?.code || "DEPENDENCY_ERROR",
+            data?.error?.message || data?.message || "Ошибка зависимого сервиса"
+        );
+    }
+    return data;
+}
+
+function parsePositiveInt(value: unknown, fallback: number) {
+    const n = Number(value);
+    return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+function applyRecipeFilters(qb: any, query: any) {
+    const { search, dish_type, difficulty, min_time, max_time, ingredients } = query;
+
+    qb.andWhere("r.is_published = :isPublished", { isPublished: true });
+
+    if (search) {
+        qb.andWhere("(r.title ILIKE :search OR r.description ILIKE :search)", {
+            search: `%${String(search)}%`
+        });
+    }
+    if (dish_type) qb.andWhere("r.dish_type = :dishType", { dishType: String(dish_type) });
+    if (difficulty) qb.andWhere("r.difficulty = :difficulty", { difficulty: String(difficulty) });
+
+    if (min_time !== undefined && min_time !== "") {
+        const value = Number(min_time);
+        if (!Number.isFinite(value)) throw new Error("INVALID_MIN_TIME");
+        qb.andWhere("r.cooking_time_min >= :minTime", { minTime: value });
+    }
+
+    if (max_time !== undefined && max_time !== "") {
+        const value = Number(max_time);
+        if (!Number.isFinite(value)) throw new Error("INVALID_MAX_TIME");
+        qb.andWhere("r.cooking_time_min <= :maxTime", { maxTime: value });
+    }
+
+    if (ingredients) {
+        const ingredientIds = String(ingredients)
+            .split(",")
+            .map(Number)
+            .filter(Number.isInteger);
+
+        if (!ingredientIds.length) throw new Error("INVALID_INGREDIENTS");
+
+        qb.andWhere(
+            `r.recipe_id IN (
+                SELECT ri.recipe_id
+                FROM recipe_ingredients ri
+                WHERE ri.ingredient_id IN (:...ingredientIds)
+                GROUP BY ri.recipe_id
+                HAVING COUNT(DISTINCT ri.ingredient_id) = :ingredientCount
+            )`,
+            { ingredientIds, ingredientCount: ingredientIds.length }
+        );
+    }
+}
+
+async function getSocialSummaries(recipeIds: number[]) {
+    if (!recipeIds.length) return [];
+    try {
+        const data = await callJson(socialUrl(), "/internal/recipes/summaries", {
+            method: "POST",
+            body: JSON.stringify({ recipe_ids: recipeIds })
+        });
+        return Array.isArray(data?.items) ? data.items : [];
+    } catch {
+        return recipeIds.map(recipe_id => ({ recipe_id, likes_count: 0 }));
+    }
+}
+
+async function getAuthor(authorId: number) {
+    try {
+        return await callJson(userUrl(), `/internal/users/${authorId}`);
+    } catch (error) {
+        if (error instanceof DependencyError && error.status === 404) {
+            return { user_id: authorId };
+        }
+        throw error;
     }
 }
 
 export class RecipeController {
-
-   
-    static getAll = async (
-        req: AuthRequest,
-        res: ExpressResponse
-    ) => {
+    static getAll = async (req: Request, res: Response) => {
         try {
-            const rows = await recipes().find({
-                order: {
-                    recipe_id: "ASC"
-                }
-            });
+            const page = parsePositiveInt(req.query.page, 1);
+            const limit = Math.min(parsePositiveInt(req.query.limit, 20), 100);
+            const sortBy = String(req.query.sort_by || "published_at");
 
-            const result = await Promise.all(
-                rows.map(async (recipe) => {
-                    let author: any = {
-                        user_id: recipe.author_id
-                    };
+            const baseQb = recipes().createQueryBuilder("r");
+            applyRecipeFilters(baseQb, req.query);
+            baseQb.select([
+                "r.recipe_id", "r.title", "r.description", "r.photo_main_url",
+                "r.cooking_time_min", "r.difficulty", "r.dish_type",
+                "r.author_id", "r.published_at"
+            ]);
 
-                    try {
-                        author = await call(
-                            userUrl(),
-                            `/internal/users/${recipe.author_id}`
-                        );
-                    } catch {
-                        
-                    }
+            const allRows = await baseQb.getMany();
+            const total = allRows.length;
 
-                    return {
-                        recipe_id: recipe.recipe_id,
-                        title: recipe.title,
-                        description: recipe.description,
-                        photo_main_url: recipe.photo_main_url,
-                        cooking_time_min: recipe.cooking_time_min,
-                        difficulty: recipe.difficulty,
-                        dish_type: recipe.dish_type,
-                        author_id: recipe.author_id,
-                        author,
-                        published_at: recipe.published_at
-                    };
-                })
-            );
+            const summaries = await getSocialSummaries(allRows.map(r => r.recipe_id));
+            const summaryById = new Map<number, any>(summaries.map((s: any) => [Number(s.recipe_id), s]));
 
-            return res.json(result);
-
-        } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка получения рецептов"
-                }
-            });
-        }
-    };
-
-
-   
-    static getMine = async (
-        req: AuthRequest,
-        res: ExpressResponse
-    ) => {
-        try {
-            const userId = req.userId!;
-
-            const result = await recipes().find({
-                where: {
-                    author_id: userId
-                },
-                order: {
-                    recipe_id: "ASC"
-                }
-            });
-
-            return res.json(result);
-
-        } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка получения рецептов пользователя"
-                }
-            });
-        }
-    };
-
-
-   
-    static getOne = async (
-        req: Request,
-        res: ExpressResponse
-    ) => {
-        try {
-            const recipeId = Number(req.params.recipe_id);
-
-            const recipe = await recipes().findOne({
-                where: {
-                    recipe_id: recipeId
-                }
-            });
-
-            if (!recipe) {
-                return res.status(404).json({
-                    error: {
-                        code: "RECIPE_NOT_FOUND",
-                        message: "Рецепт не найден"
-                    }
+            if (sortBy === "likes_count") {
+                allRows.sort((a, b) => {
+                    const diff = Number(summaryById.get(b.recipe_id)?.likes_count || 0) - Number(summaryById.get(a.recipe_id)?.likes_count || 0);
+                    return diff || (new Date(b.published_at).getTime() - new Date(a.published_at).getTime());
                 });
+            } else if (sortBy === "cooking_time_min") {
+                allRows.sort((a, b) => a.cooking_time_min - b.cooking_time_min);
+            } else {
+                allRows.sort((a, b) => new Date(b.published_at).getTime() - new Date(a.published_at).getTime());
             }
 
-            let author: any = {
-                user_id: recipe.author_id
-            };
-
-            try {
-                author = await call(
-                    userUrl(),
-                    `/internal/users/${recipe.author_id}`
-                );
-            } catch {
-                
-            }
-
-            return res.json({
+            const rows = allRows.slice((page - 1) * limit, page * limit);
+            const items = await Promise.all(rows.map(async recipe => ({
                 recipe_id: recipe.recipe_id,
                 title: recipe.title,
                 description: recipe.description,
@@ -193,328 +162,285 @@ export class RecipeController {
                 difficulty: recipe.difficulty,
                 dish_type: recipe.dish_type,
                 author_id: recipe.author_id,
-                author,
+                author: await getAuthor(recipe.author_id),
+                likes_count: Number(summaryById.get(recipe.recipe_id)?.likes_count || 0),
                 published_at: recipe.published_at
-            });
+            })));
 
-        } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка получения рецепта"
-                }
+            return res.json({ items, total, page, limit });
+        } catch (error) {
+            console.error(error);
+            return res.status(400).json({
+                error: { code: "VALIDATION_ERROR", message: "Ошибка запроса" }
             });
         }
     };
 
+    static getMine = async (req: AuthRequest, res: Response) => {
+        try {
+            const rows = await recipes().find({
+                where: { author_id: req.userId! },
+                order: { published_at: "DESC" }
+            });
+            const items = await Promise.all(rows.map(async recipe => ({
+                recipe_id: recipe.recipe_id,
+                title: recipe.title,
+                description: recipe.description,
+                photo_main_url: recipe.photo_main_url,
+                cooking_time_min: recipe.cooking_time_min,
+                difficulty: recipe.difficulty,
+                dish_type: recipe.dish_type,
+                author_id: recipe.author_id,
+                author: await getAuthor(recipe.author_id),
+                published_at: recipe.published_at
+            })));
+            return res.json({ items, total: items.length, page: 1, limit: 20 });
+        } catch {
+            return res.status(503).json({
+                error: { code: "SERVICE_UNAVAILABLE", message: "Ошибка получения рецептов пользователя" }
+            });
+        }
+    };
 
-    
-    static create = async (
-        req: AuthRequest,
-        res: ExpressResponse
-    ) => {
+    static getOne = async (req: Request, res: Response) => {
+        try {
+            const recipeId = Number(req.params.recipe_id);
+            const recipe = await recipes().findOne({
+                where: { recipe_id: recipeId },
+                relations: ["steps", "recipeIngredients", "recipeIngredients.ingredient"]
+            });
+
+            if (!recipe) {
+                return res.status(404).json({
+                    error: { code: "NOT_FOUND", message: "Рецепт не найден" }
+                });
+            }
+
+            const author = await getAuthor(recipe.author_id);
+            return res.json({
+                recipe_id: recipe.recipe_id,
+                title: recipe.title,
+                description: recipe.description,
+                photo_main_url: recipe.photo_main_url,
+                video_url: recipe.video_url,
+                cooking_time_min: recipe.cooking_time_min,
+                difficulty: recipe.difficulty,
+                dish_type: recipe.dish_type,
+                steps: (recipe.steps || [])
+                    .sort((a, b) => a.step_number - b.step_number)
+                    .map(s => ({
+                        step_id: s.step_id,
+                        step_number: s.step_number,
+                        instruction_text: s.instruction_text,
+                        photo_url: s.photo_url
+                    })),
+                ingredients: (recipe.recipeIngredients || []).map(ri => ({
+                    ingredient_id: ri.ingredient_id,
+                    name: ri.ingredient?.name,
+                    category: ri.ingredient?.category,
+                    quantity: ri.quantity
+                })),
+                author,
+                published_at: recipe.published_at
+            });
+        } catch (error) {
+            console.error(error);
+            return res.status(503).json({
+                error: { code: "SERVICE_UNAVAILABLE", message: "Ошибка получения рецепта" }
+            });
+        }
+    };
+
+    static create = async (req: AuthRequest, res: Response) => {
         try {
             const authorId = req.userId!;
+            await callJson(userUrl(), `/internal/users/${authorId}/exists`);
+
+            const {
+                title,
+                description,
+                photo_main_url,
+                video_url,
+                cooking_time_min,
+                difficulty,
+                dish_type,
+                steps: rawSteps,
+                ingredients: rawIngredients
+            } = req.body;
 
             
-            await call(
-                userUrl(),
-                `/internal/users/${authorId}/exists`
-            );
-
             const recipe = recipes().create({
-                ...req.body,
+                title,
+                description,
+                photo_main_url,
+                video_url,
+                cooking_time_min,
+                difficulty,
+                dish_type,
                 author_id: authorId
             });
 
-            const saved = await recipes().save(recipe);
+            await recipes().save(recipe);
 
-            return res.status(201).json(saved);
+            if (Array.isArray(rawSteps) && rawSteps.length > 0) {
+                const stepRepository = AppDataSource.getRepository(Step);
 
+                const steps = rawSteps.map((step: any, index: number) =>
+                    stepRepository.create({
+                        recipe_id: recipe.recipe_id,
+                        step_number: Number(step.step_number ?? index + 1),
+                        instruction_text: String(step.instruction_text || ""),
+                        photo_url: step.photo_url || null
+                    })
+                );
+
+                await stepRepository.save(steps);
+            }
+
+            if (Array.isArray(rawIngredients) && rawIngredients.length > 0) {
+                const recipeIngredientRepository =
+                    AppDataSource.getRepository(RecipeIngredient);
+
+                const recipeIngredients = rawIngredients.map((ingredient: any) =>
+                    recipeIngredientRepository.create({
+                        recipe_id: recipe.recipe_id,
+                        ingredient_id: Number(ingredient.ingredient_id),
+                        quantity: String(ingredient.quantity ?? "")
+                    })
+                );
+
+                await recipeIngredientRepository.save(recipeIngredients);
+            }
+
+            return res.status(201).json({
+                message: "Рецепт создан",
+                recipe_id: recipe.recipe_id
+            });
         } catch (error: any) {
-
             if (error instanceof DependencyError) {
-
-                if (error.status === 404) {
-                    return res.status(404).json({
-                        error: {
-                            code: "USER_NOT_FOUND",
-                            message: "Пользователь не найден"
-                        }
-                    });
-                }
-
-                return res.status(503).json({
+                return res.status(error.status === 404 ? 404 : 503).json({
                     error: {
-                        code: "SERVICE_UNAVAILABLE",
-                        message: "UserService недоступен"
+                        code: error.status === 404 ? "USER_NOT_FOUND" : "SERVICE_UNAVAILABLE",
+                        message: error.status === 404
+                            ? "Пользователь не найден"
+                            : "UserService недоступен"
                     }
                 });
             }
 
-            return res.status(500).json({
+            console.error(error);
+            return res.status(400).json({
                 error: {
-                    code: "INTERNAL_ERROR",
+                    code: "VALIDATION_ERROR",
                     message: "Ошибка создания рецепта"
                 }
             });
         }
     };
 
-
-    
-    static update = async (
-        req: AuthRequest,
-        res: ExpressResponse
-    ) => {
+    static update = async (req: AuthRequest, res: Response) => {
         try {
             const recipeId = Number(req.params.recipe_id);
+            const recipe = await recipes().findOne({ where: { recipe_id: recipeId } });
 
-            const recipe = await recipes().findOne({
-                where: {
-                    recipe_id: recipeId
-                }
-            });
+            if (!recipe) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Рецепт не найден" } });
+            if (recipe.author_id !== req.userId) return res.status(403).json({ error: { code: "FORBIDDEN", message: "Чужой рецепт" } });
 
-            if (!recipe) {
-                return res.status(404).json({
-                    error: {
-                        code: "RECIPE_NOT_FOUND",
-                        message: "Рецепт не найден"
-                    }
-                });
-            }
-
-            if (recipe.author_id !== req.userId) {
-                return res.status(403).json({
-                    error: {
-                        code: "FORBIDDEN",
-                        message: "Нет прав на изменение этого рецепта"
-                    }
-                });
-            }
-
-            await recipes().update(
-                recipeId,
-                req.body
-            );
-
-            const updated = await recipes().findOne({
-                where: {
-                    recipe_id: recipeId
-                }
-            });
-
-            return res.json(updated);
-
+            const { title, description, difficulty } = req.body;
+            await recipes().update(recipeId, { title, description, difficulty });
+            return res.json({ message: "Рецепт обновлён" });
         } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка обновления рецепта"
-                }
-            });
+            return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Ошибка обновления" } });
         }
     };
 
-
-    
-    static delete = async (
-        req: AuthRequest,
-        res: ExpressResponse
-    ) => {
+    static delete = async (req: AuthRequest, res: Response) => {
         try {
             const recipeId = Number(req.params.recipe_id);
-
-            const recipe = await recipes().findOne({
-                where: {
-                    recipe_id: recipeId
-                }
-            });
-
-            if (!recipe) {
-                return res.status(404).json({
-                    error: {
-                        code: "RECIPE_NOT_FOUND",
-                        message: "Рецепт не найден"
-                    }
-                });
-            }
-
-            if (recipe.author_id !== req.userId) {
-                return res.status(403).json({
-                    error: {
-                        code: "FORBIDDEN",
-                        message: "Нет прав на удаление этого рецепта"
-                    }
-                });
-            }
-
+            const recipe = await recipes().findOne({ where: { recipe_id: recipeId } });
+            if (!recipe) return res.status(404).json({ error: { code: "NOT_FOUND", message: "Рецепт не найден" } });
+            if (recipe.author_id !== req.userId) return res.status(403).json({ error: { code: "FORBIDDEN", message: "Чужой рецепт" } });
             await recipes().delete(recipeId);
-
-            return res.status(204).send();
-
+            return res.json({ message: "Рецепт удалён" });
         } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка удаления рецепта"
-                }
-            });
+            return res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "Ошибка удаления" } });
         }
     };
 
-
-    
-    static internalGet = async (
-        req: Request,
-        res: ExpressResponse
-    ) => {
+    static internalGet = async (req: Request, res: Response) => {
         try {
-            const recipeId = Number(req.params.recipe_id);
-
             const recipe = await recipes().findOne({
-                where: {
-                    recipe_id: recipeId
-                }
+                where: { recipe_id: Number(req.params.recipe_id) },
+                relations: ["steps", "recipeIngredients", "recipeIngredients.ingredient"]
             });
-
-            if (!recipe) {
-                return res.status(404).json({
-                    error: {
-                        code: "RECIPE_NOT_FOUND",
-                        message: "Рецепт не найден"
-                    }
-                });
-            }
-
+            if (!recipe) return res.status(404).json({ error: { code: "RECIPE_NOT_FOUND", message: "Рецепт не найден" } });
             return res.json(recipe);
-
         } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка получения рецепта"
-                }
-            });
+            return res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Ошибка получения рецепта" } });
         }
     };
 
-
-    
-    static internalExists = async (
-        req: Request,
-        res: ExpressResponse
-    ) => {
+    static internalExists = async (req: Request, res: Response) => {
         try {
             const recipeId = Number(req.params.recipe_id);
-
-            const exists = await recipes().exist({
-                where: {
-                    recipe_id: recipeId
-                }
-            });
-
-            if (!exists) {
-                return res.status(404).json({
-                    error: {
-                        code: "RECIPE_NOT_FOUND",
-                        message: "Рецепт не найден"
-                    }
-                });
-            }
-
-            return res.json({
-                recipe_id: recipeId,
-                exists: true
-            });
-
+            const recipe = await recipes().findOne({ where: { recipe_id: recipeId }, select: ["recipe_id", "author_id"] });
+            if (!recipe) return res.status(404).json({ error: { code: "RECIPE_NOT_FOUND", message: "Рецепт не найден" } });
+            return res.json({ recipe_id: recipeId, exists: true, author_id: recipe.author_id });
         } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка проверки рецепта"
-                }
-            });
+            return res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Ошибка проверки рецепта" } });
         }
     };
 
-
-    
-    static internalByAuthor = async (
-        req: Request,
-        res: ExpressResponse
-    ) => {
+    static internalByAuthor = async (req: Request, res: Response) => {
         try {
             const userId = Number(req.params.user_id);
-
-            const result = await recipes().find({
-                where: {
-                    author_id: userId
-                },
-                order: {
-                    recipe_id: "ASC"
-                }
-            });
-
-            return res.json(result);
-
+            const rows = await recipes().find({ where: { author_id: userId }, order: { published_at: "DESC" } });
+            const items = await Promise.all(rows.map(async recipe => ({
+                recipe_id: recipe.recipe_id,
+                title: recipe.title,
+                description: recipe.description,
+                photo_main_url: recipe.photo_main_url,
+                cooking_time_min: recipe.cooking_time_min,
+                difficulty: recipe.difficulty,
+                dish_type: recipe.dish_type,
+                author_id: recipe.author_id,
+                author: await getAuthor(recipe.author_id),
+                published_at: recipe.published_at
+            })));
+            return res.json({ items, total: items.length, page: 1, limit: 20 });
         } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка получения рецептов пользователя"
-                }
-            });
+            return res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Ошибка получения рецептов пользователя" } });
         }
     };
 
-
-    
-    static internalByIds = async (
-        req: Request,
-        res: ExpressResponse
-    ) => {
+    static internalByIds = async (req: Request, res: Response) => {
         try {
-            let ids: number[] = [];
+            const ids = Array.isArray(req.body?.recipe_ids)
+                ? req.body.recipe_ids.map(Number).filter(Number.isInteger)
+                : [];
+            if (!ids.length) return res.json({ items: [], total: 0, page: 1, limit: 20 });
 
-            if (Array.isArray(req.body?.recipe_ids)) {
-                ids = req.body.recipe_ids
-                    .map(Number)
-                    .filter((id: number) => !Number.isNaN(id));
-            }
-
-            if (
-                ids.length === 0 &&
-                typeof req.query.ids === "string"
-            ) {
-                ids = req.query.ids
-                    .split(",")
-                    .map(Number)
-                    .filter((id: number) => !Number.isNaN(id));
-            }
-
-            if (ids.length === 0) {
-                return res.json([]);
-            }
-
-            const result = await recipes()
-                .createQueryBuilder("recipe")
-                .where(
-                    "recipe.recipe_id IN (:...ids)",
-                    { ids }
-                )
-                .getMany();
-
-            return res.json(result);
-
-        } catch {
-            return res.status(500).json({
-                error: {
-                    code: "INTERNAL_ERROR",
-                    message: "Ошибка получения рецептов"
-                }
+            const rows = await recipes().find({
+                where: ids.map(recipe_id => ({ recipe_id })),
+                order: { published_at: "DESC" }
             });
+
+            const items = await Promise.all(rows.map(async recipe => ({
+                recipe_id: recipe.recipe_id,
+                title: recipe.title,
+                description: recipe.description,
+                photo_main_url: recipe.photo_main_url,
+                cooking_time_min: recipe.cooking_time_min,
+                difficulty: recipe.difficulty,
+                dish_type: recipe.dish_type,
+                author_id: recipe.author_id,
+                author: await getAuthor(recipe.author_id),
+                published_at: recipe.published_at
+            })));
+
+            return res.json({ items, total: items.length, page: 1, limit: 20 });
+        } catch {
+            return res.status(500).json({ error: { code: "INTERNAL_ERROR", message: "Ошибка получения рецептов" } });
         }
     };
 }

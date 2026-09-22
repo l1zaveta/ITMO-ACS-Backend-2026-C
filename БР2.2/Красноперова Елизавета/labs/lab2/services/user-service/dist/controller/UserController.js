@@ -99,14 +99,19 @@ UserController.myRecipes = async (req, res) => {
 };
 UserController.savedRecipes = async (req, res) => {
     try {
-        const recipes = await callJson(socialUrl(), `/internal/users/${req.userId}/saved`);
+        const saved = await callJson(socialUrl(), `/internal/users/${req.userId}/saved`);
+        const recipeIds = Array.isArray(saved === null || saved === void 0 ? void 0 : saved.recipe_ids) ? saved.recipe_ids : [];
+        if (!recipeIds.length) {
+            return res.json({ items: [], total: 0, page: 1, limit: 20 });
+        }
+        const recipes = await callJson(recipeUrl(), "/internal/recipes/by-ids", { method: "POST", body: JSON.stringify({ recipe_ids: recipeIds }) });
         return res.json(recipes);
     }
     catch (_b) {
         return res.status(503).json({
             error: {
                 code: "SERVICE_UNAVAILABLE",
-                message: "SocialService недоступен"
+                message: "Зависимый сервис недоступен"
             }
         });
     }
